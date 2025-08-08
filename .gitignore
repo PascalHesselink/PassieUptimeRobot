@@ -1,0 +1,5 @@
+monitor.db
+monitor.db*
+node_modules
+.idea
+.env
