@@ -1,0 +1,46 @@
+version: "3.8"
+
+services:
+  db:
+    image: mysql:8.0
+    container_name: passie-uptime-db
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-passie_uptime}
+      MYSQL_USER: ${MYSQL_USER:-passie}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-passiepass}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpass}
+    volumes:
+      - dbdata:/var/lib/mysql
+      - ./schema.sql:/docker-entrypoint-initdb.d/1-schema.sql:ro
+    ports:
+      - "${MYSQL_PORT:-3307}:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PASSWORD:-rootpass}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  app:
+    build: .
+    container_name: passie-uptime-robot
+    restart: "no"
+    env_file: .env
+    environment:
+      DB_HOST: ${DB_HOST:-db}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_USER: ${DB_USER:-passie}
+      DB_PASS: ${DB_PASS:-passiepass}
+      DB_NAME: ${DB_NAME:-passie_uptime}
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "sh", "-c", "for i in $(seq 1 5); do nc -z ${DB_HOST:-db} ${DB_PORT:-3306} && exit 0 || sleep 5; done; exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 1
+
+volumes:
+  dbdata:
