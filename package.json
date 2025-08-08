@@ -3,7 +3,11 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "docker compose up -d --build --force-recreate",
+    "reset": "docker compose down -v && docker compose up -d --build --force-recreate",
+    "stop": "docker compose down",
+    "logs": "docker compose logs -f app db",
+    "test:mail": "docker compose exec app node /app/test-mail.js"
   },
   "keywords": [],
   "author": "",
