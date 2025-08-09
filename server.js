@@ -1,8 +1,7 @@
-// server.js
 require('dotenv').config()
 
 const { execFile } = require('child_process')
-const { randomUUID } = require('crypto')
+const { randomUUID, createHash } = require('crypto')
 const https = require('https')
 const { URL } = require('url')
 const { sendEmail } = require('./mailer')
@@ -45,20 +44,39 @@ function normalizeDbRow(row) {
   }
 }
 
+const MAX_CONCURRENT = Math.max(1, Number(process.env.MAX_CONCURRENT_CHECKS || 32))
+const SPLAY_WINDOW_SEC = Math.max(1, Number(process.env.SPLAY_WINDOW_SEC || 60))
+const JITTER_MS = Math.max(0, Number(process.env.REFRESH_JITTER_MS || 5000))
+
 console.log('=== PassieUptimeRobot Starting ===')
 console.log('Initializing database (MySQL)...')
 
 async function migrate() {
   const dbName = process.env.DB_NAME
-  const col = await query(
+  const col1 = await query(
     `SELECT 1 FROM information_schema.COLUMNS
      WHERE TABLE_SCHEMA=? AND TABLE_NAME='target_urls' AND COLUMN_NAME='ssl_days_remaining'`,
     [dbName]
   )
-  if (!col.length) {
+  if (!col1.length) {
     await run('ALTER TABLE target_urls ADD COLUMN ssl_days_remaining INT NULL', [])
   }
+  const col2 = await query(
+    `SELECT 1 FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA=? AND TABLE_NAME='target_urls' AND COLUMN_NAME='spread_offset'`,
+    [dbName]
+  )
+  if (!col2.length) {
+    await run('ALTER TABLE target_urls ADD COLUMN spread_offset INT NULL', [])
+    const rows = await query('SELECT id FROM target_urls', [])
+    for (const r of rows) {
+      const off = Number(BigInt('0x' + createHash('sha1').update(String(r.id)).digest('hex')) % BigInt(SPLAY_WINDOW_SEC))
+      await run('UPDATE target_urls SET spread_offset=? WHERE id=?', [off, r.id])
+    }
+  }
 }
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)) }
 
 function checkWithCurl(url, timeoutSeconds) {
   return new Promise(resolve => {
@@ -67,7 +85,7 @@ function checkWithCurl(url, timeoutSeconds) {
     const MARK = '___CURL_HTTP_CODE___'
     execFile(
       'curl',
-      ['-sS', '-L', '-A', 'PassieUptimeRobot/1.0', '--max-time', String(to), url, '-w', `\n${MARK}:%{http_code}\n`],
+      ['-sS','-L','-A','PassieUptimeRobot/1.0','--max-time',String(to),'--retry','2','--retry-delay','1','--retry-all-errors',url,'-w',`\n${MARK}:%{http_code}\n`],
       { timeout: to * 1000 },
       (err, stdout, stderr) => {
         const duration = Date.now() - start
@@ -80,11 +98,12 @@ function checkWithCurl(url, timeoutSeconds) {
           const rest = out.slice(idx).split(':')[1] || '0'
           code = parseInt(rest, 10) || 0
         }
-        const up = code >= 200 && code < 400
+        const transientDns = /getaddrinfo\(\).*failed to start/i.test(out) || /getaddrinfo\(\).*failed to start/i.test(errStr)
+        const up = (code >= 200 && code < 400) || transientDns
         if (err && code === 0 && !body && errStr) body = errStr
         const maxLen = 8192
         const response = up ? null : (body || null)
-        resolve({ up, code, time: duration, response: response ? response.slice(0, maxLen) : null })
+        resolve({ up, code, time: duration, response: response ? response.slice(0, maxLen) : null, transient_dns: transientDns })
       }
     )
   })
@@ -152,7 +171,7 @@ function formatDurationSeconds(totalSeconds) {
 
 async function listEnabled() {
   return await query(
-    'SELECT id, url, name, refresh_seconds, timeout_seconds, ssl_expiration_days, last_checked_unix FROM target_urls WHERE enabled=1 ORDER BY id',
+    'SELECT id, url, name, refresh_seconds, timeout_seconds, ssl_expiration_days, last_checked_unix, IFNULL(spread_offset, -1) AS spread_offset FROM target_urls WHERE enabled=1 ORDER BY id',
     []
   )
 }
@@ -388,19 +407,20 @@ async function performCheck(target, runId) {
   const prev = await selectPrevStat(target.id)
   const prevUp = prev ? Number(prev.is_up) : null
   await markChecked(target.id, nowUnix)
-  const { up, code, time, response } = await checkWithCurl(target.url, target.timeout_seconds)
+  const { up, code, time, response, transient_dns } = await checkWithCurl(target.url, target.timeout_seconds)
   const statId = await insertStat(target.id, up, nowIso, nowUnix, time, code, response)
   if (up) {
     console.log(`${label} UP http=${code} time=${time}ms`)
     await markUp(target.id, nowIso, nowUnix)
   } else {
+    if (transient_dns) return
     const preview = response ? ` resp=${JSON.stringify(response.slice(0, 200))}` : ''
     console.log(`${label} DOWN http=${code} time=${time}ms${preview}`)
     await markDown(target.id, nowIso, nowUnix)
   }
   const currUp = up ? 1 : 0
   if (prevUp === null) {
-    if (!currUp) {
+    if (!currUp && !transient_dns) {
       const key = `stat:${statId}`
       await notifyUserAboutChange(target, 'uptime', key, `FIRST CHECK: Site is DOWN (HTTP ${code}, ${time}ms)`, 'Website is DOWN')
     }
@@ -412,8 +432,10 @@ async function performCheck(target, runId) {
       const key = `stat:${statId}`
       await notifyUserAboutChange(target, 'uptime', key, `Site is UP (HTTP ${code}, ${time}ms).${extra}`, 'Website is UP')
     } else {
-      const key = `stat:${statId}`
-      await notifyUserAboutChange(target, 'uptime', key, `Site is DOWN (HTTP ${code}, ${time}ms)`, 'Website is DOWN')
+      if (!transient_dns) {
+        const key = `stat:${statId}`
+        await notifyUserAboutChange(target, 'uptime', key, `Site is DOWN (HTTP ${code}, ${time}ms)`, 'Website is DOWN')
+      }
     }
   }
   if (/^https:/i.test(target.url)) {
@@ -434,6 +456,24 @@ async function seedFromEnv() {
 }
 
 const inFlight = new Set()
+let running = 0
+const queue = []
+
+function schedule(fn) { queue.push(fn); drain() }
+function drain() { while (running < MAX_CONCURRENT && queue.length) { const fn = queue.shift(); running++; fn().finally(() => { running--; drain() }) } }
+
+function dueBySplay(row, now) {
+  const r = Math.max(1, Number(row.refresh_seconds || 60))
+  const off = row.spread_offset == null || row.spread_offset < 0 ? (Number(row.id) % SPLAY_WINDOW_SEC) : Number(row.spread_offset % r)
+  const sec = now % r
+  return sec === off
+}
+
+function jitterFor(id) {
+  const h = createHash('sha1').update(String(id)).digest()
+  const n = h.readUInt32BE(0)
+  return JITTER_MS ? (n % JITTER_MS) : 0
+}
 
 async function schedulerTick() {
   await seedFromEnv()
@@ -441,19 +481,30 @@ async function schedulerTick() {
   const now = Math.floor(Date.now() / 1000)
   const rows = await listEnabled()
   if (!rows.length) return
+  const startMs = Date.now()
+  const batch = []
   for (const row of rows) {
     const last = row.last_checked_unix || 0
-    const due = now - last >= (row.refresh_seconds || 60)
+    const dueTime = now - last >= (row.refresh_seconds || 60)
+    if (!dueTime) continue
+    if (!dueBySplay(row, now)) continue
     const key = `${row.id}`
-    if (due && !inFlight.has(key)) {
+    if (!inFlight.has(key)) {
       inFlight.add(key)
-      performCheck(row, runId).catch(err => {
-        console.error(`run=${runId} site="${row.name}" err`, err && err.message ? err.message : err)
-      }).finally(() => {
-        inFlight.delete(key)
+      const wait = jitterFor(row.id)
+      batch.push(async () => {
+        const drift = Date.now() - startMs
+        const rem = Math.max(0, wait - drift)
+        if (rem) await sleep(rem)
+        return performCheck(row, runId).catch(err => {
+          console.error(`run=${runId} site="${row.name}" err`, err && err.message ? err.message : err)
+        }).finally(() => {
+          inFlight.delete(key)
+        })
       })
     }
   }
+  for (const job of batch) schedule(job)
 }
 
 async function main() {

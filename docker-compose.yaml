@@ -25,6 +25,13 @@ services:
   app:
     build: .
     container_name: passie-uptime-robot
+    ulimits:
+      nofile: 65535
+      nproc: 8192
+    pids_limit: 4096
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     restart: "no"
     env_file: .env
     environment:
