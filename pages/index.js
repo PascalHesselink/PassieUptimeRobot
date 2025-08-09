@@ -34,10 +34,11 @@ function sslLabel(v){
   if(v==null) return 'unknown'
   return Number(v)===1 ? 'VALID' : 'INVALID'
 }
-function durationCell(startUnix){
-  if(startUnix==null) return '-'
-  const ms = Number(startUnix)*1000
-  return `<small>${timeAgo(ms)}</small>`
+function durationCell(startUnix, uptimePct){
+  if(startUnix==null && uptimePct==null) return '-'
+  const dur = startUnix==null ? '' : `<small>${timeAgo(Number(startUnix)*1000)}</small>`
+  const pct = (uptimePct==null || Number.isNaN(Number(uptimePct))) ? '' : `<br><small>Uptime: ${Number(uptimePct).toFixed(2)}%</small>`
+  return `${dur}${pct}` || '-'
 }
 
 module.exports = function(app){
@@ -60,6 +61,23 @@ module.exports = function(app){
            FROM target_url_ssl
            GROUP BY target_url_id
          ) ms ON ms.target_url_id = ts.target_url_id AND ts.id = ms.max_id
+       ),
+       users_agg AS (
+         SELECT tu.target_url_id, GROUP_CONCAT(u.name ORDER BY u.name SEPARATOR ', ') AS users_names
+         FROM target_url_user tu
+         JOIN users u ON u.id = tu.user_id
+         WHERE tu.enabled = 1
+         GROUP BY tu.target_url_id
+       ),
+       notif_agg AS (
+         SELECT n.target_url_id, COUNT(*) AS notif_count
+         FROM notifications n
+         GROUP BY n.target_url_id
+       ),
+       uptime_agg AS (
+         SELECT target_url_id, ROUND(100 * SUM(is_up) / NULLIF(COUNT(*),0), 2) AS uptime_pct
+         FROM target_url_stats
+         GROUP BY target_url_id
        )
        SELECT
          t.id, t.name, t.url, t.last_up, t.last_down, t.last_checked_unix,
@@ -78,12 +96,18 @@ module.exports = function(app){
          ) AS state_since_unix,
          lssl.is_valid AS ssl_is_valid,
          lssl.days_left AS ssl_days_left,
-         lssl.created_at AS ssl_last_change
+         lssl.created_at AS ssl_last_change,
+         ua.users_names,
+         na.notif_count,
+         up.uptime_pct
        FROM target_urls t
        LEFT JOIN latest_stat ls ON ls.target_url_id = t.id
        LEFT JOIN latest_ssl lssl ON lssl.target_url_id = t.id
+       LEFT JOIN users_agg ua ON ua.target_url_id = t.id
+       LEFT JOIN notif_agg na ON na.target_url_id = t.id
+       LEFT JOIN uptime_agg up ON up.target_url_id = t.id
        WHERE t.enabled = 1
-       ORDER BY t.id`, []
+       ORDER BY (state_since_unix IS NULL), state_since_unix DESC`, []
     )
 
     const rowsHtml = rows.map(r => {
@@ -92,13 +116,15 @@ module.exports = function(app){
         <td>${r.name || '-'}</td>
         <td><a href="${r.url}" target="_blank" rel="noopener noreferrer">${r.url}</a></td>
         <td>${stateLabel(r.is_up)}</td>
-        <td>${durationCell(r.state_since_unix)}</td>
+        <td>${durationCell(r.state_since_unix, r.uptime_pct)}</td>
         <td>${fmtDateCell(r.last_up)}</td>
         <td>${fmtDateCell(r.last_down)}</td>
         <td>${fmtUnixCell(r.last_checked_unix)}</td>
         <td>${sslLabel(r.ssl_is_valid)}</td>
         <td>${r.ssl_days_left == null ? '-' : `${r.ssl_days_left} days`}</td>
         <td>${fmtDateCell(r.ssl_last_change)}</td>
+        <td>${r.users_names || '-'}</td>
+        <td>${r.notif_count == null ? '0' : String(r.notif_count)}</td>
       </tr>`
     }).join('\n')
 
@@ -118,17 +144,19 @@ module.exports = function(app){
       <th>Name</th>
       <th>URL</th>
       <th>Current State</th>
-      <th>State Duration</th>
+      <th>State Duration / Uptime</th>
       <th>Last Up</th>
       <th>Last Down</th>
       <th>Last Checked</th>
       <th>SSL State</th>
       <th>SSL Days Left</th>
       <th>Last SSL Change</th>
+      <th>Users</th>
+      <th>Notifications</th>
     </tr>
   </thead>
   <tbody>
-    ${rowsHtml || '<tr><td colspan="11">No targets</td></tr>'}
+    ${rowsHtml || '<tr><td colspan="13">No targets</td></tr>'}
   </tbody>
 </table>
 </body>
