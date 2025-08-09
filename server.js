@@ -1,18 +1,15 @@
+// server.js
 require('dotenv').config()
 
 const { execFile } = require('child_process')
 const { randomUUID, createHash } = require('crypto')
 const https = require('https')
 const { URL } = require('url')
+const express = require('express')
+const { toMySQLDateTime } = require('./lib/time')
 const { sendEmail } = require('./mailer')
 const { query, run } = require('./db')
 
-function pad2(n) { return String(n).padStart(2, '0') }
-function toMySQLDateTime(input) {
-  const d = input instanceof Date ? input : new Date(input)
-  if (Number.isNaN(d.getTime())) return null
-  return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth()+1)}-${pad2(d.getUTCDate())} ${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}:${pad2(d.getUTCSeconds())}`
-}
 function nowMySQL() { return toMySQLDateTime(new Date()) }
 function normStr(s) { return (s == null ? '' : String(s)).trim() }
 function normFp(s) { return normStr(s).toUpperCase() }
@@ -508,16 +505,22 @@ async function schedulerTick() {
 }
 
 async function main() {
-  console.log('PassieUptimeRobot application starting (MySQL)...')
   await migrate()
   await seedFromEnv()
   const initialTargets = await listEnabled()
   for (const t of initialTargets) {
     await backfillNotificationsForTarget(t)
   }
-  console.log('Scheduler loop: tick every 1 second; per-site refresh respected.')
   await schedulerTick()
   setInterval(schedulerTick, 1000)
 }
+
+const app = express()
+require('./pages')(app)
+
+const port = Number(process.env.STATS_PORT || process.env.PORT || 8080)
+app.listen(port, () => {
+  console.log(`Stats server listening on :${port}`)
+})
 
 if (require.main === module) main()

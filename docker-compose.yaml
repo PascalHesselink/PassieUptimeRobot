@@ -25,14 +25,7 @@ services:
   app:
     build: .
     container_name: passie-uptime-robot
-    ulimits:
-      nofile: 65535
-      nproc: 8192
-    pids_limit: 4096
-    dns:
-      - 1.1.1.1
-      - 8.8.8.8
-    restart: "no"
+    restart: unless-stopped
     env_file: .env
     environment:
       DB_HOST: ${DB_HOST:-db}
@@ -40,6 +33,16 @@ services:
       DB_USER: ${DB_USER:-passie}
       DB_PASS: ${DB_PASS:-passiepass}
       DB_NAME: ${DB_NAME:-passie_uptime}
+      STATS_PORT: ${STATS_PORT:-8080}
+    ports:
+      - "${APP_HTTP_PORT:-8080}:${STATS_PORT:-8080}"
+    ulimits:
+      nofile: 65535
+      nproc: 8192
+    pids_limit: 4096
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     depends_on:
       db:
         condition: service_healthy
